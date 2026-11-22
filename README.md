@@ -79,3 +79,22 @@ npm run dev
 
 领域：数据工程
 子方向：数据分析与数据应用
+
+## 审计数据契约
+
+普通调用（`call_audit`）与导出事件（`export_task`）共用
+`backend/app/services/audit_contract.py` 一份编码、取号、落盘与查询口径：
+
+- 公共信封：`audit_id`、`event`（`api_call` / `export_completed`）、`api_name`、
+  `caller`、`timestamp`、`_logged_at`、`contract_version`、`write_state`、
+  `confirmed`；各自业务字段与旧数据保持一致（调用事件的 `record_no` /
+  `request_params` / `response_code` / `latency_ms` / `result_rows`，导出事件的
+  `export_id` / `task_no` / `query_params` / `export_format` / `rows_count` /
+  `file_name` / `file_path`）。
+- 取号：两类事件共用同一数字序列，并参考暂存残片与失败预留，避免互相覆盖。
+- 落盘：`audit/.staging/` 暂存 + fsync + 原子改名；中断的写入不会出现在
+  `audit/*.json`，只在 `include_pending=True` / `pending_records()` 核对视角可见，
+  且会预留编号。没有 `write_state` 的旧记录按已确认兼容读取。
+- 取数：`list_audit(...)` 支持 `event`、`include_pending`；调用审计用
+  `CallAuditService.list_confirmed_calls()` / `verify_audits()`，导出任务用
+  `ExportTaskService.list_confirmed_exports()`，均可按 API、调用方、时间检索。

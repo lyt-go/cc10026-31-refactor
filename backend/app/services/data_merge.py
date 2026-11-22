@@ -82,10 +82,9 @@ class DataMergeService(BaseModuleService):
         merged = self.merge_sources(rule_id, source_a_rows, source_b_rows)
         rule = store.find(self.MODULE, rule_id)
 
-        # 联动增强：归并结果写入审计
-        from app.services.data_manager import write_audit, DATA_ROOT
-        audit_id = max((int(f.stem) for f in DATA_ROOT.glob("audit/[0-9]*.json")), default=0) + 1
-        write_audit(audit_id, {
+        # 联动增强：归并结果写入审计（统一契约取号 + 原子落盘）
+        from app.services.data_manager import append_audit_event
+        append_audit_event(lambda audit_id: {
             "audit_id": audit_id,
             "api_name": rule.get("主API", "") if rule else "",
             "caller": "data_merge",

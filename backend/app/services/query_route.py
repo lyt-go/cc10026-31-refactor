@@ -75,17 +75,19 @@ class QueryRouteService(BaseModuleService):
                 row["_degrade_reason"] = reason
                 row["_degrade_at"] = self._now_iso()
 
-                # 联动增强：记录降级事件到审计
-                from app.services.data_manager import write_audit, DATA_ROOT
-                audit_id = max((int(f.stem) for f in DATA_ROOT.glob("audit/[0-9]*.json")), default=0) + 1
-                write_audit(audit_id, {
-                    "audit_id": audit_id,
-                    "api_name": row.get("关联API", ""),
-                    "caller": "sla_monitor",
-                    "event": "route_degraded",
-                    "reason": reason,
-                    "degrade_at": row["_degrade_at"],
-                })
+                # 联动增强：记录降级事件到审计（统一契约取号 + 原子落盘）
+                from app.services.data_manager import append_audit_event
+                append_audit_event(
+                    lambda audit_id: {
+                        "audit_id": audit_id,
+                        "api_name": row.get("关联API", ""),
+                        "caller": "sla_monitor",
+                        "event": "route_degraded",
+                        "reason": reason,
+                        "degrade_at": row["_degrade_at"],
+                    },
+                    extra_ids=[r.get("id") for r in rows],
+                )
                 return row
         return {}
 

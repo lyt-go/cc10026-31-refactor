@@ -28,26 +28,36 @@ class CallAuditService(BaseModuleService):
     def record_api_call(self, caller: str, api_name: str, params: str = "",
                         response_code: str = "200", latency_ms: float = 0.0,
                         result_rows: int = 0) -> dict[str, Any]:
-        """记录一次API调用到审计日志。"""
-        from app.services.data_manager import write_audit
+        """记录一次API调用到审计日志。
+
+        事件编码走统一审计数据契约；数字引用沿用模块行号（未被占用时），
+        与旧数据、导出事件共用同一编号序列，避免撞号。
+        """
+        from app.services import audit_contract
+        from app.services.data_manager import append_audit_event
         from app.store import store as s
 
+        timestamp = self._now_iso()
         audit_rows = s.rows(self.MODULE)
-        new_id = max((int(r.get("id", 0)) for r in audit_rows), default=0) + 1
-        record_no = f"CALL-{new_id:04d}"
+        preferred_id = max((int(r.get("id", 0)) for r in audit_rows), default=0) + 1
 
-        audit_data = {
-            "audit_id": new_id,
-            "record_no": record_no,
-            "caller": caller,
-            "api_name": api_name,
-            "request_params": params,
-            "response_code": response_code,
-            "latency_ms": latency_ms,
-            "result_rows": result_rows,
-            "timestamp": self._now_iso(),
-        }
-        write_audit(new_id, audit_data)
+        record = append_audit_event(
+            lambda audit_id: audit_contract.encode_call_event(
+                audit_id=audit_id,
+                record_no=f"CALL-{audit_id:04d}",
+                caller=caller,
+                api_name=api_name,
+                request_params=params,
+                response_code=response_code,
+                latency_ms=latency_ms,
+                result_rows=result_rows,
+                timestamp=timestamp,
+            ),
+            extra_ids=[row.get("id") for row in audit_rows],
+            preferred=preferred_id,
+        )
+        new_id = int(record["audit_id"])
+        record_no = record["record_no"]
 
         # 同时记录到内存
         entry = {
@@ -59,7 +69,7 @@ class CallAuditService(BaseModuleService):
             "响应码": response_code,
             "响应耗时": str(latency_ms),
             "返回行数": str(result_rows),
-            "时间戳": self._now_iso(),
+            "时间戳": timestamp,
             "status": "已记录",
             "pending": True,
             "abnormal": response_code != "200",
@@ -71,9 +81,26 @@ class CallAuditService(BaseModuleService):
         from datetime import datetime, timedelta, timezone
         return datetime.now(timezone(timedelta(hours=8))).isoformat()
 
+    def list_confirmed_calls(self, caller: str | None = None, api_name: str | None = None,
+                             start_time: str | None = None, end_time: str | None = None) -> list[dict[str, Any]]:
+        """按 API/调用方/时间取已确认的普通调用事件（不含导出事件与未完成写入）。"""
+        from app.services import audit_contract
+        from app.services.data_manager import list_audit
+        return list_audit(
+            api_name=api_name,
+            caller=caller,
+            start_time=start_time,
+            end_time=end_time,
+            event=audit_contract.CALL_EVENT,
+        )
+
     def verify_audits(self, caller: str, api_name: str) -> list[dict[str, Any]]:
-        """校验调用方对指定API的审计记录。"""
-        from app.services.data_manager import list_audit, read_api_snapshot
+        """校验调用方对指定API的已确认审计记录。
+
+        只取已确认落盘的调用事件；导出事件和写入未完成的事件不参与调用审计，
+        按原口径（API + 调用方）检索时不会与调用记录混作一笔。
+        """
+        from app.services.data_manager import read_api_snapshot
 
         # 检查API是否已注册
         registry = read_api_snapshot()
@@ -84,7 +111,7 @@ class CallAuditService(BaseModuleService):
         if not api_exists:
             return []
 
-        audits = list_audit(api_name=api_name, caller=caller)
+        audits = self.list_confirmed_calls(caller=caller, api_name=api_name)
         # 校验订阅状态
         from app.services.data_manager import list_subscriptions
         subs = list_subscriptions()

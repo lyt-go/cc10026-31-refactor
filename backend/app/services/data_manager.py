@@ -17,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from app.services import audit_contract
+
 # 数据目录相对于仓库根
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", str(
     Path(__file__).resolve().parents[3] / "data"
@@ -168,41 +170,78 @@ def settle_billing(billing_cycle: str, use_auto_settlement: bool = True) -> dict
 # ========== 调用审计 ==========
 
 
-def write_audit(audit_id: int, audit_data: dict[str, Any]) -> None:
-    """写入审计记录。"""
-    audit_data["_logged_at"] = _now_iso()
-    _write_json(DATA_ROOT / "audit" / f"{audit_id:06d}.json", audit_data)
+def allocate_audit_id(extra_ids: list[int | str | None] | None = None,
+                      preferred: int | None = None) -> int:
+    """按审计数据契约分配下一个数字审计编号。
+
+    ``preferred`` 用于保留旧引用：该编号未被占用时沿用，否则顺延到下一个可用编号。
+    """
+    return audit_contract.allocate_audit_id(DATA_ROOT, extra_ids=extra_ids, preferred=preferred)
+
+
+def append_audit_event(build_event, *, extra_ids=None, preferred=None) -> dict[str, Any]:
+    """在同一把锁内完成取号、编码和落盘，返回实际写入的记录。
+
+    落盘仍经过 :func:`write_audit`，保留该写入入口作为唯一审计落盘点。
+    """
+    with audit_contract.lock():
+        audit_id = allocate_audit_id(extra_ids=extra_ids, preferred=preferred)
+        record = build_event(audit_id)
+        if not isinstance(record, dict):
+            raise TypeError("审计事件编码结果必须是 dict")
+        record = dict(record)
+        record["audit_id"] = int(audit_id)
+        try:
+            return write_audit(audit_id, record)
+        except BaseException:
+            audit_contract.reserve_audit_id(DATA_ROOT, audit_id)
+            raise
+
+
+def write_audit(audit_id: int, audit_data: dict[str, Any]) -> dict[str, Any]:
+    """按审计数据契约写入审计记录，返回实际落盘的记录。
+
+    旧调用方只需传 ``audit_id`` 和事件字典；公共信封字段与确认标记由契约补齐，
+    原有业务字段原样保留。写入使用暂存文件 + 原子改名，中途失败不会留下
+    可被正常查询命中的半条记录。
+    """
+    return audit_contract.write_event(DATA_ROOT, audit_id, audit_data)
 
 
 def read_audit(audit_id: int) -> dict[str, Any]:
-    return _read_json(DATA_ROOT / "audit" / f"{audit_id:06d}.json", {})
+    """读取单条已确认审计记录；未完成写入不会出现在这里。"""
+    record = _read_json(DATA_ROOT / "audit" / f"{audit_id:06d}.json", {})
+    return record if audit_contract.is_confirmed(record) else {}
 
 
 def list_audit(api_name: str | None = None, caller: str | None = None,
-               start_time: str | None = None, end_time: str | None = None) -> list[dict[str, Any]]:
-    """按条件查询审计记录。"""
-    _ensure_dir(DATA_ROOT / "audit")
-    records = []
-    for f in sorted(DATA_ROOT.glob("audit/*.json")):
-        record = _read_json(f)
-        if not record:
-            continue
-        if api_name and record.get("api_name") != api_name:
-            continue
-        if caller and record.get("caller") != caller:
-            continue
-        if start_time and record.get("_logged_at", "") < start_time:
-            continue
-        if end_time and record.get("_logged_at", "") > end_time:
-            continue
-        records.append(record)
-    return records
+               start_time: str | None = None, end_time: str | None = None,
+               include_pending: bool = False, event: str | None = None) -> list[dict[str, Any]]:
+    """按条件查询审计记录（两类事件共用的取数口径）。
+
+    默认只返回已确认落盘的事件，写入中断的残片留在 ``audit/.staging/``，
+    不会与已确认事件混作同一笔。``include_pending=True`` 时才额外读取残片，
+    用于审计核对。旧数据没有确认标记，按已确认兼容读取。
+    ``event`` 可按事件类型隔离普通调用与导出事件。
+    """
+    return audit_contract.query_events(
+        DATA_ROOT,
+        event=event,
+        api_name=api_name,
+        caller=caller,
+        start_time=start_time,
+        end_time=end_time,
+        include_pending=include_pending,
+    )
 
 
 def archive_audit_records(before_date: str) -> dict[str, Any]:
     """归档指定日期之前的审计记录。"""
     records = list_audit()
-    archived = [r for r in records if r.get("_logged_at", "")[:10] < before_date]
+    archived = [
+        r for r in records
+        if r.get("_logged_at", "")[:10] < before_date and str(r.get("audit_id", "")).isdigit()
+    ]
     archive_data = {
         "archive_date": _now_iso(),
         "before_date": before_date,
@@ -221,17 +260,17 @@ def archive_audit_records(before_date: str) -> dict[str, Any]:
 # ========== 导出任务 ==========
 
 
-def write_export(export_id: int, export_data: dict[str, Any]) -> None:
-    """写入导出任务结果。"""
+def write_export(export_id: int, export_data: dict[str, Any]) -> dict[str, Any]:
+    """写入导出任务结果，返回可写入审计事件的文件信息。"""
     export_data["_created_at"] = export_data.get("_created_at", _now_iso())
     export_data["_updated_at"] = _now_iso()
     _write_json(DATA_ROOT / "exports" / f"{export_id:06d}.json", export_data)
     # 同时生成一份导出 CSV
-    _write_export_csv(export_id, export_data)
+    return _write_export_csv(export_id, export_data)
 
 
-def _write_export_csv(export_id: int, export_data: dict[str, Any]) -> None:
-    """根据导出数据生成 CSV 文件头。"""
+def _write_export_csv(export_id: int, export_data: dict[str, Any]) -> dict[str, Any]:
+    """根据导出数据生成 CSV 文件，返回供审计事件回查的文件信息。"""
     columns = export_data.get("columns", [])
     rows = export_data.get("rows", [])
     csv_path = DATA_ROOT / "exports" / f"{export_id:06d}.csv"
@@ -239,6 +278,11 @@ def _write_export_csv(export_id: int, export_data: dict[str, Any]) -> None:
     for row in rows:
         lines.append(",".join(str(v) for v in row))
     csv_path.write_text("\n".join(lines), encoding="utf-8")
+    return {
+        "file_name": csv_path.name,
+        "file_path": str(csv_path.relative_to(DATA_ROOT)),
+        "json_path": f"exports/{export_id:06d}.json",
+    }
 
 
 def read_export(export_id: int) -> dict[str, Any]:

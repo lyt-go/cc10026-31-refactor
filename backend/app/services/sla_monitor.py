@@ -51,7 +51,7 @@ class SlaMonitorService(BaseModuleService):
         联动增强：偏离事件自动写入 error_classify 的异常入库记录，
         同时写入调用审计记录。
         """
-        from app.services.data_manager import write_module_snapshot, write_audit, DATA_ROOT
+        from app.services.data_manager import write_module_snapshot
         # 记录SLA事件快照给error_classify消费
         snap = {
             "module": self.MODULE,
@@ -62,9 +62,9 @@ class SlaMonitorService(BaseModuleService):
         }
         write_module_snapshot("sla_events", snap)
 
-        # 联动增强：自动写入error_classify异常归类记录
-        audit_id = max((int(f.stem) for f in DATA_ROOT.glob("audit/[0-9]*.json")), default=0) + 1
-        write_audit(audit_id, {
+        # 联动增强：自动写入error_classify异常归类记录（统一契约取号 + 原子落盘）
+        from app.services.data_manager import append_audit_event
+        append_audit_event(lambda audit_id: {
             "audit_id": audit_id,
             "api_name": api_name,
             "caller": "sla_monitor",

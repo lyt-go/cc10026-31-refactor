@@ -31,7 +31,12 @@ class ExportTaskService(BaseModuleService):
     NEGATIVE_ACTIONS = []
 
     def execute_export(self, export_id: int) -> dict[str, Any]:
-        """执行导出任务：查询数据 → 过滤 → 脱敏 → 格式化 → 写入文件。"""
+        """执行导出任务：查询数据 → 过滤 → 脱敏 → 格式化 → 写入文件 → 审计确认。
+
+        导出文件与审计事件共用同一份导出元数据；只有审计事件完整落盘，
+        这笔导出才算确认完成。审计写盘中断时任务保持未完成，
+        已写出的文件不会被审计查询误当成成功事件。
+        """
         entry = store.find(self.MODULE, export_id)
         if entry is None:
             return {"ok": False, "message": "任务不存在"}
@@ -69,23 +74,52 @@ class ExportTaskService(BaseModuleService):
             "rows": [[str(r.get(c, "")) for c in columns] for r in source_rows],
             "status": "已完成",
         }
-        write_export(export_id, export_data)
+        file_info = write_export(export_id, export_data)
 
-        # 写审计记录
-        from app.services.data_manager import write_audit
-        audit_id = self._next_audit_id()
-        write_audit(audit_id, {
-            "audit_id": audit_id,
-            "api_name": api_name,
-            "caller": "export_task",
-            "event": "export_completed",
-            "export_id": export_id,
-            "rows_count": len(source_rows),
-        })
+        # 写审计记录：统一契约编码，导出事件补齐文件信息
+        from app.services import audit_contract
+        from app.services.data_manager import append_audit_event
+
+        try:
+            append_audit_event(
+                lambda audit_id: audit_contract.encode_export_event(
+                    audit_id=audit_id,
+                    export_id=export_id,
+                    api_name=api_name,
+                    caller="export_task",
+                    task_no=str(entry.get("任务编号", "")),
+                    query_params=str(entry.get("查询参数", "")),
+                    export_format=str(entry.get("导出格式", "json")),
+                    rows_count=len(source_rows),
+                    file_name=file_info.get("file_name", ""),
+                    file_path=file_info.get("file_path", ""),
+                ),
+                extra_ids=[row.get("id") for row in store.rows(self.MODULE)],
+            )
+        except Exception as exc:  # 审计写盘中断：不确认为已完成
+            entry["status"] = "导出中"
+            entry["pending"] = True
+            entry["abnormal"] = True
+            entry["_audit_failed"] = True
+            return {
+                "ok": False,
+                "message": f"导出已写盘但审计记录未确认：{type(exc).__name__}",
+                "export_id": export_id,
+                "rows_count": len(source_rows),
+                "confirmed": False,
+            }
 
         entry["status"] = "已完成"
         entry["数据行数"] = str(len(source_rows))
-        return {"ok": True, "export_id": export_id, "rows_count": len(source_rows)}
+        entry["_audit_failed"] = False
+        return {
+            "ok": True,
+            "export_id": export_id,
+            "rows_count": len(source_rows),
+            "file_name": file_info.get("file_name", ""),
+            "file_path": file_info.get("file_path", ""),
+            "confirmed": True,
+        }
 
     def _mock_query(self, api_name: str) -> list[dict[str, Any]]:
         """模拟从数据源查询结果。"""
@@ -96,9 +130,27 @@ class ExportTaskService(BaseModuleService):
         ]
 
     def _next_audit_id(self) -> int:
-        from app.services.data_manager import DATA_ROOT
-        existing = list(DATA_ROOT.glob("audit/[0-9]*.json"))
-        return max((int(f.stem) for f in existing), default=0) + 1
+        """保留旧入口：现在统一从审计数据契约取号。"""
+        from app.services.data_manager import allocate_audit_id
+        return allocate_audit_id(extra_ids=[row.get("id") for row in store.rows(self.MODULE)])
+
+    def list_confirmed_exports(self, api_name: str | None = None,
+                               caller: str = "export_task",
+                               start_time: str | None = None,
+                               end_time: str | None = None) -> list[dict[str, Any]]:
+        """按 API/调用方/时间取已确认的导出事件，并可回查导出文件信息。
+
+        写入中断的导出不会出现在这里，即使导出文件已经落到 data/exports/。
+        """
+        from app.services import audit_contract
+        from app.services.data_manager import list_audit
+        return list_audit(
+            api_name=api_name,
+            caller=caller,
+            start_time=start_time,
+            end_time=end_time,
+            event=audit_contract.EXPORT_EVENT,
+        )
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)

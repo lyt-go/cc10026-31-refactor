@@ -36,9 +36,6 @@ class RateLimiterService(BaseModuleService):
 
     def check_rate_limit(self, api_name: str, caller: str, rate_type: str = "daily") -> dict[str, Any]:
         """检查调用方是否超过频率限制。返回限流检查结果。"""
-        from app.services.data_manager import write_audit
-        from app.store import store as s
-
         rows = store.rows(self.MODULE)
         for row in rows:
             if row.get("目标API") == api_name and row.get("调用方") == caller and row.get("status") == "已生效":
@@ -47,14 +44,19 @@ class RateLimiterService(BaseModuleService):
                 if limit <= 0:
                     return {"allowed": True, "limit": limit, "reason": "无限制"}
 
-                # 检查审计记录中的调用计数
+                # 检查审计记录中的调用计数（只算已确认的普通调用事件）
+                from app.services import audit_contract
                 from app.services.data_manager import list_audit
                 today = self._today_str()
-                audits = list_audit(api_name=api_name, caller=caller, start_time=today)
+                audits = [
+                    record for record in list_audit(
+                        api_name=api_name, caller=caller, start_time=today)
+                    if audit_contract.is_call_event(record)
+                ]
                 if len(audits) >= limit:
-                    # 超限 → 写审计记录
-                    audit_id = self._next_audit_id()
-                    write_audit(audit_id, {
+                    # 超限 → 写审计记录（统一契约取号 + 原子落盘）
+                    from app.services.data_manager import append_audit_event
+                    append_audit_event(lambda audit_id: {
                         "audit_id": audit_id,
                         "api_name": api_name,
                         "caller": caller,
@@ -68,10 +70,9 @@ class RateLimiterService(BaseModuleService):
         return {"allowed": True, "limit": 0, "reason": "未配置限流策略"}
 
     def _next_audit_id(self) -> int:
-        from app.services.data_manager import DATA_ROOT
-        import os
-        existing = list(DATA_ROOT.glob("audit/[0-9]*.json"))
-        return max((int(f.stem) for f in existing), default=0) + 1
+        """保留旧入口：现在统一从审计数据契约取号。"""
+        from app.services.data_manager import allocate_audit_id
+        return allocate_audit_id(extra_ids=[row.get("id") for row in store.rows(self.MODULE)])
 
     def _today_str(self) -> str:
         from datetime import datetime, timedelta, timezone

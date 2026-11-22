@@ -98,18 +98,20 @@ class UsageBillingService(BaseModuleService):
             billing_cycle = entry.get("计费周期", self._current_billing_cycle())
             settlement = settle_billing(billing_cycle, use_auto_settlement=True)
 
-            # 联动增强：结算完成写入调用审计记录
-            from app.services.data_manager import write_audit, DATA_ROOT
-            audit_id = max((int(f.stem) for f in DATA_ROOT.glob("audit/[0-9]*.json")), default=0) + 1
-            write_audit(audit_id, {
-                "audit_id": audit_id,
-                "api_name": entry.get("API名称", ""),
-                "caller": entry.get("调用方", ""),
-                "event": "billing_settled",
-                "billing_cycle": billing_cycle,
-                "total_amount": settlement.get("total_amount", 0),
-                "total_calls": settlement.get("total_calls", 0),
-            })
+            # 联动增强：结算完成写入调用审计记录（统一契约取号 + 原子落盘）
+            from app.services.data_manager import append_audit_event
+            append_audit_event(
+                lambda audit_id: {
+                    "audit_id": audit_id,
+                    "api_name": entry.get("API名称", ""),
+                    "caller": entry.get("调用方", ""),
+                    "event": "billing_settled",
+                    "billing_cycle": billing_cycle,
+                    "total_amount": settlement.get("total_amount", 0),
+                    "total_calls": settlement.get("total_calls", 0),
+                },
+                extra_ids=[r.get("id") for r in store.rows(self.MODULE)],
+            )
 
         from app.services.data_manager import write_module_snapshot
         write_module_snapshot(self.MODULE, self.domain_snapshot())
